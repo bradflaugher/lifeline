@@ -2,22 +2,18 @@
 """lifeline — a "phone a friend" tool for coding agents (MCP stdio server).
 
 Like the Who-Wants-to-Be-a-Millionaire lifeline: when the agent driving your
-coding session (crush, Claude Code, Codex, …) hits a hard problem, it calls
-`phone_a_friend` to consult a more powerful / different model and get a
-second opinion before committing.
+coding session (crush, Claude Code, Codex, Antigravity, Grok, opencode, …) hits
+a hard problem, it calls `phone_a_friend` to consult a more powerful or
+different model and get a second opinion before committing.
 
-Backends ("friends") are pluggable. Two transports are built in:
+Everything routes through **OpenRouter** (one OpenAI-compatible endpoint, one
+API key). Backends ("friends") are pluggable; the built-in roster is:
 
-  * openrouter — any model on OpenRouter (OpenAI-compatible chat completions),
-                 including the `openrouter/fusion` multi-model deliberation panel.
-  * anthropic  — Anthropic's native Messages API, with the Claude Fable 5
-                 request shape (thinking always-on so it's omitted; depth via
-                 output_config.effort; server-side fallback to Opus on refusal).
-
-Default friends:
-  * fusion — OpenRouter Fusion panel (Opus + GPT + Gemini Pro deliberate, judge synthesizes).
-  * fable  — Claude Fable 5. Prefers the native Anthropic API (ANTHROPIC_API_KEY);
-             falls back to Fable 5 via OpenRouter (OPENROUTER_API_KEY) if that's all you have.
+  * fusion — OpenRouter Fusion: a panel of frontier models (Opus, GPT, Gemini
+             Pro) deliberate in parallel and a judge synthesizes their answers.
+  * fable  — Claude Fable 5 (via OpenRouter: `anthropic/claude-fable-5`).
+             Requires Fable access on your OpenRouter account; until then the
+             call returns a clear "not available" error.
 
 Override the roster with a JSON file at $LIFELINE_CONFIG or ./lifeline.json
 (see README). Pick the default friend with $LIFELINE_DEFAULT_FRIEND.
@@ -33,15 +29,10 @@ import urllib.request
 import urllib.error
 
 SERVER_NAME = "lifeline"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
-ANTHROPIC_FALLBACK_MODEL = "claude-opus-4-8"  # rescues a spurious Fable-5 refusal
-ANTHROPIC_FALLBACK_BETA = "server-side-fallback-2026-06-01"
-
 MAX_TOKENS = 8000
 TIMEOUT = 240
 
@@ -55,7 +46,7 @@ SYSTEM_PROMPT = (
     "what is in the question."
 )
 
-# --- Friend roster -----------------------------------------------------------
+# --- Friend roster (all routes go through OpenRouter) ------------------------
 
 DEFAULT_FRIENDS = {
     "fusion": {
@@ -63,18 +54,13 @@ DEFAULT_FRIENDS = {
                  "Gemini Pro) deliberate in parallel and a judge synthesizes their "
                  "answers. Best for second opinions, design trade-offs, "
                  "compare-and-contrast, and 'am I missing something?' checks.",
-        "routes": [{"provider": "openrouter", "model": "openrouter/fusion"}],
+        "model": "openrouter/fusion",
     },
     "fable": {
         "blurb": "Claude Fable 5 — Anthropic's most capable model; deep single-model "
                  "reasoning for the hardest bugs, tricky algorithms, and long-horizon "
-                 "design problems.",
-        # First viable route wins: native Anthropic API if you have the key,
-        # otherwise Fable 5 through OpenRouter.
-        "routes": [
-            {"provider": "anthropic", "model": "claude-fable-5", "effort": "high"},
-            {"provider": "openrouter", "model": "anthropic/claude-fable-5"},
-        ],
+                 "design problems. (Requires Fable access on your OpenRouter account.)",
+        "model": "anthropic/claude-fable-5",
     },
 }
 
@@ -93,41 +79,18 @@ def load_friends():
     return friends
 
 
-def provider_available(provider):
-    if provider == "openrouter":
-        return bool(os.environ.get("OPENROUTER_API_KEY"))
-    if provider == "anthropic":
-        return bool(os.environ.get("ANTHROPIC_API_KEY"))
-    return False
-
-
-def pick_route(friend):
-    """First route whose provider has credentials, or None."""
-    for route in friend.get("routes", []):
-        if provider_available(route.get("provider")):
-            return route
-    return None
-
-
-def available_friends(friends):
-    return {name: f for name, f in friends.items() if pick_route(f) is not None}
+def has_key():
+    return bool(os.environ.get("OPENROUTER_API_KEY"))
 
 
 def default_friend_name(friends):
-    avail = available_friends(friends)
     pref = os.environ.get("LIFELINE_DEFAULT_FRIEND", "fusion")
-    if pref in avail:
+    if pref in friends:
         return pref
-    return next(iter(avail), None)
+    return next(iter(friends), None)
 
 
-# --- Transports --------------------------------------------------------------
-
-def _post(url, body, headers):
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        return json.load(resp)
-
+# --- OpenRouter transport ----------------------------------------------------
 
 def call_openrouter(model, prompt):
     body = {
@@ -144,63 +107,21 @@ def call_openrouter(model, prompt):
         "HTTP-Referer": "https://github.com/bradflaugher/lifeline",
         "X-Title": "lifeline phone_a_friend",
     }
-    data = _post(OPENROUTER_URL, body, headers)
+    req = urllib.request.Request(OPENROUTER_URL, data=json.dumps(body).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        data = json.load(resp)
     answer = data["choices"][0]["message"]["content"]
-    judge = data.get("model", model)
-    cost = (data.get("usage") or {}).get("cost")
-    meta = f"{judge}" + (f" · cost ${cost:.4f}" if isinstance(cost, (int, float)) else "")
-    return answer, meta
-
-
-def call_anthropic(model, prompt, effort="high"):
-    body = {
-        "model": model,
-        "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": prompt}],
-        "output_config": {"effort": effort},
-        # NOTE: no `thinking` param — Fable 5 has thinking always on and rejects
-        # an explicit thinking config; depth is controlled via output_config.effort.
-    }
-    headers = {
-        "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-        "anthropic-version": ANTHROPIC_VERSION,
-        "Content-Type": "application/json",
-    }
-    # Opt into a server-side fallback so a spurious safety refusal on adjacent
-    # work doesn't kill the lifeline (Fable 5 can return stop_reason=refusal).
-    if model != ANTHROPIC_FALLBACK_MODEL:
-        headers["anthropic-beta"] = ANTHROPIC_FALLBACK_BETA
-        body["fallbacks"] = [{"model": ANTHROPIC_FALLBACK_MODEL}]
-
-    data = _post(ANTHROPIC_URL, body, headers)
-    if data.get("stop_reason") == "refusal":
-        det = data.get("stop_details") or {}
-        return None, f"Anthropic declined this request (category: {det.get('category')})."
-    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     served = data.get("model", model)
-    usage = data.get("usage") or {}
-    meta = f"{served} · {usage.get('input_tokens', '?')}in/{usage.get('output_tokens', '?')}out tok"
-    return text, None if text else "Empty response from Anthropic."
-
-
-def dispatch(route, prompt):
-    provider = route.get("provider")
-    model = route.get("model")
-    if provider == "openrouter":
-        return call_openrouter(model, prompt)
-    if provider == "anthropic":
-        return call_anthropic(model, prompt, route.get("effort", "high"))
-    return None, f"Unknown provider: {provider}"
+    cost = (data.get("usage") or {}).get("cost")
+    meta = served + (f" · cost ${cost:.4f}" if isinstance(cost, (int, float)) else "")
+    return answer, meta
 
 
 # --- MCP plumbing ------------------------------------------------------------
 
 def build_tool_schema(friends):
-    avail = available_friends(friends)
     default = default_friend_name(friends)
-    roster = "\n".join(f"  - {name}: {f['blurb']}" for name, f in avail.items()) or \
-        "  (none — set OPENROUTER_API_KEY and/or ANTHROPIC_API_KEY)"
+    roster = "\n".join(f"  - {name}: {f['blurb']}" for name, f in friends.items())
     desc = (
         "Phone a friend — consult a more powerful or different AI for help on a HARD "
         "problem where you are stuck or want a high-confidence second opinion (subtle "
@@ -212,58 +133,54 @@ def build_tool_schema(friends):
     )
     if default:
         desc += f"\n\nDefault friend if unspecified: {default}."
-    schema = {
-        "type": "object",
-        "properties": {
-            "question": {
-                "type": "string",
-                "description": "The hard question, with enough context to answer standalone.",
+    return {
+        "name": "phone_a_friend",
+        "description": desc,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The hard question, with enough context to answer standalone.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional extra context: relevant code, error output, constraints.",
+                },
+                "friend": {
+                    "type": "string",
+                    "enum": list(friends.keys()),
+                    "description": f"Which friend to call. Defaults to '{default}'.",
+                },
             },
-            "context": {
-                "type": "string",
-                "description": "Optional extra context: relevant code, error output, constraints.",
-            },
+            "required": ["question"],
         },
-        "required": ["question"],
     }
-    if avail:
-        schema["properties"]["friend"] = {
-            "type": "string",
-            "enum": list(avail.keys()),
-            "description": f"Which friend to call. Defaults to '{default}'.",
-        }
-    return {"name": "phone_a_friend", "description": desc, "inputSchema": schema}
 
 
 def run_phone_a_friend(args, friends):
     question = args.get("question")
     if not question:
         return "Error: 'question' is required.", True
-
-    avail = available_friends(friends)
-    if not avail:
-        return ("No friends are reachable. Set OPENROUTER_API_KEY and/or "
-                "ANTHROPIC_API_KEY in the lifeline server's environment."), True
+    if not has_key():
+        return "OPENROUTER_API_KEY is not set in the lifeline server's environment.", True
 
     name = args.get("friend") or default_friend_name(friends)
-    if name not in avail:
-        return (f"Unknown or unavailable friend '{name}'. "
-                f"Available: {', '.join(avail)}."), True
+    if name not in friends:
+        return f"Unknown friend '{name}'. Available: {', '.join(friends)}.", True
 
-    route = pick_route(avail[name])
+    model = friends[name].get("model")
     prompt = question if not args.get("context") else \
         f"{question}\n\n--- Additional context ---\n{args['context']}"
 
     try:
-        answer, meta = dispatch(route, prompt)
+        answer, meta = call_openrouter(model, prompt)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:400]
         return f"phone_a_friend error ({name}): HTTP {e.code}: {detail}", True
     except Exception as e:  # noqa: BLE001
         return f"phone_a_friend error ({name}): {e}", True
 
-    if answer is None:
-        return f"phone_a_friend ({name}): {meta}", True
     return f"{answer}\n\n---\n_via {name} ({meta})_", False
 
 
