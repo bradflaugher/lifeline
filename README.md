@@ -34,16 +34,24 @@ all relevant code and context.
 
 ## Configuration
 
+**Required — just one thing:**
+
 | Env var | Purpose |
 |---|---|
-| `OPENROUTER_API_KEY` | **required** — used for every call |
-| `LIFELINE_DEFAULT_FRIEND` | default friend when the call omits one (default `fusion`) |
-| `LIFELINE_CONFIG` | path to a JSON roster file (else `~/.config/lifeline/lifeline.json` if present) |
-| `LIFELINE_IDLE_TIMEOUT` | seconds of **silence** before a stream is treated as dead (default `60`, clamped 5–600) |
-| `LIFELINE_MAX_SECONDS` | absolute backstop on one call; `0` = unlimited (default `0`, else clamped 30–7200) |
-| `LIFELINE_MAX_TOKENS` | max output tokens per call (default `8000`, clamped 256–32000) |
-| `LIFELINE_MAX_CONCURRENCY` | max simultaneous calls; excess is rejected, not queued (default `4`, clamped 1–64) |
-| `LIFELINE_OPENROUTER_URL` | override the OpenRouter endpoint (testing / proxies) |
+| `OPENROUTER_API_KEY` | your [OpenRouter key](https://openrouter.ai/keys) — used for every call |
+
+That's it. **Everything below is optional** — sane defaults, ignore unless you
+want to tune something:
+
+| Optional env var | Default | Purpose |
+|---|---|---|
+| `LIFELINE_DEFAULT_FRIEND` | `fusion` | friend used when a call omits one |
+| `LIFELINE_CONFIG` | — | path to a custom roster file (else `~/.config/lifeline/lifeline.json`) |
+| `LIFELINE_IDLE_TIMEOUT` | `60` | seconds of **silence** before a stream is treated as dead (5–600) |
+| `LIFELINE_MAX_SECONDS` | `0` | absolute backstop per call; `0` = unlimited (else 30–7200) |
+| `LIFELINE_MAX_TOKENS` | `8000` | max output tokens per call (256–32000) |
+| `LIFELINE_MAX_CONCURRENCY` | `4` | max simultaneous calls; excess rejected, not queued (1–64) |
+| `LIFELINE_OPENROUTER_URL` | — | override the OpenRouter endpoint (testing / proxies) |
 
 ### How the timeout works
 
@@ -90,19 +98,34 @@ lifeline on demand.
 
 ## Install
 
-Requires `python3` and an `OPENROUTER_API_KEY`. The server reads the key from
-its environment, so **no secret is written into a config file or this repo** —
-make sure `OPENROUTER_API_KEY` is exported in the environment your agent
-launches from (or pass it in the agent's MCP `env` block, shown per-tool below).
+### Quick install (one command)
 
-Clone somewhere stable:
+```bash
+curl -fsSL https://raw.githubusercontent.com/bradflaugher/lifeline/main/install.sh | bash
+```
+
+Clones to `~/lifeline` (override with `LIFELINE_DIR=...`), then registers
+`lifeline` with every coding agent it finds that has an `mcp add` command
+(Claude Code, Codex, Grok Build) and prints copy-paste snippets for the
+config-file agents (Crush, Antigravity, opencode). It's **safe and re-runnable**:
+it never edits your config files and skips any agent already configured.
+
+Only prerequisite is `python3` and an **`OPENROUTER_API_KEY`** in your environment
+(`export OPENROUTER_API_KEY=sk-or-...` — get one at <https://openrouter.ai/keys>).
+The installer tells you if it's missing.
+
+### Manual install (per agent)
+
+Prefer to wire it up yourself? Clone, then follow your agent below:
 
 ```bash
 git clone https://github.com/bradflaugher/lifeline.git ~/lifeline
 ```
 
-In the snippets below, replace `~/lifeline/lifeline.py` with the absolute path
-if your agent doesn't expand `~` (most don't — use e.g. `/home/you/lifeline/lifeline.py`).
+The server reads the key from its environment, so **no secret is written into a
+config file or this repo**. In the snippets below, replace the path with your
+absolute path if your agent doesn't expand `~` (most config files don't — use
+e.g. `/home/you/lifeline/lifeline.py`).
 
 ### Claude Code
 
