@@ -42,6 +42,7 @@ all relevant code and context.
 | `LIFELINE_IDLE_TIMEOUT` | seconds of **silence** before a stream is treated as dead (default `60`, clamped 5–600) |
 | `LIFELINE_MAX_SECONDS` | absolute backstop on one call; `0` = unlimited (default `0`, else clamped 30–7200) |
 | `LIFELINE_MAX_TOKENS` | max output tokens per call (default `8000`, clamped 256–32000) |
+| `LIFELINE_MAX_CONCURRENCY` | max simultaneous calls; excess is rejected, not queued (default `4`, clamped 1–64) |
 | `LIFELINE_OPENROUTER_URL` | override the OpenRouter endpoint (testing / proxies) |
 
 ### How the timeout works
@@ -220,6 +221,25 @@ Equivalent project `.mcp.json`:
 
 Note opencode's shape: `command` is an **array** and the env block is
 `environment` (not `env`).
+
+## How the friend is prompted
+
+The system prompt steers the friend toward direct, decisive, actionable answers —
+and, crucially, toward the **simplest solution that fully works**. It borrows the
+"lazy developer" decision hierarchy from the [ponytail](https://github.com/DietrichGebert/ponytail)
+project: before proposing custom code, exhaust *does this need to exist? (YAGNI) →
+stdlib → native feature → existing dependency → one-liner → the minimum that works* —
+and never recommend speculative abstractions or over-engineering. The same prompt
+keeps it *lazy, not negligent*: trust-boundary validation, data-loss handling,
+security, and correctness are never traded away. This makes both its advice and its
+code audits sharper — it flags real risks instead of padding the answer with bloat.
+
+## Acknowledgments
+
+- [**ponytail**](https://github.com/DietrichGebert/ponytail) by Dietrich Gebert — the
+  "lazy developer" / minimalism-first prompt philosophy baked into the advisor system prompt.
+- [**OpenRouter Fusion**](https://openrouter.ai/docs/guides/routing/routers/fusion-router) —
+  the multi-model deliberation panel behind the default `fusion` friend.
 
 ## License
 

@@ -35,7 +35,7 @@ import urllib.request
 import urllib.error
 
 SERVER_NAME = "lifeline"
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -54,11 +54,22 @@ INTERNAL_ERROR = -32603
 SYSTEM_PROMPT = (
     "You are the expert a coding agent phoned as a lifeline because it is stuck "
     "or wants a high-confidence second opinion. Give a direct, decisive, "
-    "technically precise answer it can act on immediately. Prefer concrete code, "
-    "exact commands, and a clear recommendation over hedging. If the question is "
+    "technically precise answer it can act on immediately: concrete code, exact "
+    "commands, and a clear recommendation over hedging. If the question is "
     "underspecified, state the most likely intent and answer that, flagging any "
     "critical assumption. You cannot see the caller's files — reason only from "
-    "what is in the question."
+    "what is in the question.\n\n"
+    # Prompt technique borrowed from the ponytail project
+    # (https://github.com/DietrichGebert/ponytail): bias toward the simplest
+    # solution that fully works, and never recommend over-engineering.
+    "Bias hard toward the simplest solution that fully works. Before proposing "
+    "custom code, exhaust in order: (1) does this even need to exist? — if not, "
+    "say so (YAGNI); (2) the standard library; (3) a native platform feature; "
+    "(4) an already-installed dependency; (5) a one-liner; only then the minimum "
+    "that works. Don't invent abstractions, layers, or new dependencies the task "
+    "doesn't require, and don't pad a review with speculative over-engineering. "
+    "Lazy, not negligent: never trade away trust-boundary validation, data-loss "
+    "handling, security, or correctness — flag those plainly when they're at risk."
 )
 
 # Protect the protocol stream: capture the real stdout, then point sys.stdout at
@@ -104,6 +115,15 @@ def get_endpoint():
 
 def get_max_tokens():
     return _env_int("LIFELINE_MAX_TOKENS", 8000, 256, 32000)
+
+
+def get_max_concurrency():
+    return _env_int("LIFELINE_MAX_CONCURRENCY", 4, 1, 64)
+
+
+# Bounds simultaneous phone_a_friend calls (each holds a thread + an HTTPS
+# connection + burns OpenRouter quota); excess is rejected, not silently queued.
+_TOOL_SEM = threading.BoundedSemaphore(get_max_concurrency())
 
 
 # --- Friend roster (all routes go through OpenRouter) ------------------------
@@ -206,6 +226,56 @@ def _parse_single_body(raw, model):
     return answer, _meta(data.get("model", model), cost)
 
 
+def _read_chunk(resp, size=65536):
+    # read1() returns the bytes from a single underlying recv (bounded by the socket's
+    # idle timeout) without blocking to fill `size`; fall back to read() if absent.
+    reader = getattr(resp, "read1", None)
+    return reader(size) if reader is not None else resp.read(size)
+
+
+def _iter_sse_events(resp, idle, max_seconds):
+    """Yield each SSE event's joined `data` payload, parsing bytes incrementally.
+
+    Byte-incremental (not line iteration) so the max_seconds deadline is checked
+    after every read — a peer that trickles bytes without a newline can't dodge it,
+    and a silent socket still raises socket.timeout/TimeoutError after `idle`. Honors
+    multi-line `data:` framing (dispatched on a blank line) and strips exactly one
+    space after `data:` per the SSE spec (so meaningful whitespace is preserved).
+    """
+    start = time.monotonic()
+    total = 0
+    buf = bytearray()
+    data_lines = []
+    while True:
+        if max_seconds and (time.monotonic() - start) > max_seconds:
+            raise RuntimeError(f"exceeded max call duration ({max_seconds}s)")
+        chunk = _read_chunk(resp)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise RuntimeError("stream exceeded size cap")
+        buf += chunk
+        while True:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                break
+            line = bytes(buf[:nl]).rstrip(b"\r").decode("utf-8", "replace")
+            del buf[:nl + 1]
+            if line == "":  # blank line dispatches the buffered event
+                if data_lines:
+                    yield "\n".join(data_lines)
+                    data_lines = []
+            elif line.startswith(":"):  # comment / keep-alive — ignore (already reset idle)
+                continue
+            elif line.startswith("data:"):
+                v = line[5:]
+                data_lines.append(v[1:] if v[:1] == " " else v)
+            # event:/id:/retry: and unknown SSE fields are ignored
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
 def call_openrouter(model, prompt):
     """Return (answer, meta). Streams the response: a working-but-slow call is never
     cut off (each arriving byte resets the idle clock), while a silent/dead stream
@@ -248,27 +318,14 @@ def call_openrouter(model, prompt):
         if "text/event-stream" not in (resp.headers.get("Content-Type") or "").lower():
             return _parse_single_body(resp.read(MAX_RESPONSE_BYTES + 1), model)  # provider ignored stream
 
-        start = time.monotonic()
-        total = 0
         parts = []
         served, cost = model, None
         try:
-            for raw_line in resp:  # readline() under the hood; each recv bounded by `idle`
-                if max_seconds and (time.monotonic() - start) > max_seconds:
-                    raise RuntimeError(f"exceeded max call duration ({max_seconds}s)")
-                total += len(raw_line)
-                if total > MAX_RESPONSE_BYTES:
-                    raise RuntimeError("stream exceeded size cap")
-                line = raw_line.decode("utf-8", "replace").strip()
-                if not line or line.startswith(":"):
-                    continue  # blank line or keep-alive comment — already reset the idle clock
-                if not line.startswith("data:"):
-                    continue
-                payload = line[len("data:"):].strip()
-                if payload == "[DONE]":
+            for data in _iter_sse_events(resp, idle, max_seconds):
+                if data == "[DONE]":
                     break
                 try:
-                    chunk = json.loads(payload)
+                    chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
                 if isinstance(chunk.get("error"), dict):
@@ -467,6 +524,28 @@ def handle_safe(msg, friends):
             error(msg["id"], INTERNAL_ERROR, "Internal error (see server logs).")
 
 
+def dispatch(msg, friends):
+    # Control methods (initialize/tools/list/ping) and notifications are instant —
+    # run them inline so the read loop stays ordered and ping is answered immediately,
+    # even while a tool call runs on a worker thread. Only tools/call is offloaded.
+    if msg.get("method") != "tools/call" or "id" not in msg:
+        handle_safe(msg, friends)
+        return
+    # Bound concurrent tool calls; reject (don't silently queue) when saturated so
+    # the client gets a response instead of an unbounded thread/connection pileup.
+    if not _TOOL_SEM.acquire(blocking=False):
+        error(msg["id"], INTERNAL_ERROR, "Server busy: too many concurrent phone_a_friend calls.")
+        return
+
+    def run():
+        try:
+            handle_safe(msg, friends)
+        finally:
+            _TOOL_SEM.release()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def main():
     friends = load_friends()
     for line in sys.stdin:
@@ -484,9 +563,7 @@ def main():
         if not isinstance(msg, dict):
             error(None, INVALID_REQUEST, "Invalid Request")
             continue
-        # Dispatch on a daemon thread so a long phone_a_friend call doesn't block
-        # the read loop from answering ping / accepting further messages.
-        threading.Thread(target=handle_safe, args=(msg, friends), daemon=True).start()
+        dispatch(msg, friends)
 
 
 if __name__ == "__main__":
