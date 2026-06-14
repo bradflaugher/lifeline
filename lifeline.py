@@ -35,7 +35,7 @@ import urllib.request
 import urllib.error
 
 SERVER_NAME = "lifeline"
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = "2.2.1"
 DEFAULT_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -236,11 +236,13 @@ def _read_chunk(resp, size=65536):
 def _iter_sse_events(resp, idle, max_seconds):
     """Yield each SSE event's joined `data` payload, parsing bytes incrementally.
 
-    Byte-incremental (not line iteration) so the max_seconds deadline is checked
-    after every read — a peer that trickles bytes without a newline can't dodge it,
-    and a silent socket still raises socket.timeout/TimeoutError after `idle`. Honors
-    multi-line `data:` framing (dispatched on a blank line) and strips exactly one
-    space after `data:` per the SSE spec (so meaningful whitespace is preserved).
+    Byte-incremental (not line iteration) so the max_seconds deadline is re-checked
+    before each read — a peer that trickles bytes without a newline can't dodge it.
+    The cap can overrun by at most one `idle` window, but a call that finishes within
+    that window still returns its answer rather than being discarded. A silent socket
+    still raises socket.timeout/TimeoutError after `idle`. Honors multi-line `data:`
+    framing (dispatched on a blank line) and strips exactly one space after `data:`
+    per the SSE spec (so meaningful whitespace is preserved).
     """
     start = time.monotonic()
     total = 0
@@ -311,8 +313,17 @@ def call_openrouter(model, prompt):
     # keep-alives) keep arriving — it only fails after `idle` seconds of total silence.
     try:
         resp = urllib.request.urlopen(req, timeout=idle)
+    except urllib.error.HTTPError:
+        raise  # a 4xx/5xx is handled (with its status code) by run_phone_a_friend
     except (socket.timeout, TimeoutError):
         raise RuntimeError(f"no response within {idle}s (connection idle)")
+    except urllib.error.URLError as e:
+        # A connect timeout arrives as URLError wrapping the timeout in .reason,
+        # not as a bare socket.timeout — normalize it to the same idle message.
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise RuntimeError(f"no response within {idle}s (connection idle)")
+        raise RuntimeError(f"connection failed: {reason}")
 
     with resp:
         if "text/event-stream" not in (resp.headers.get("Content-Type") or "").lower():
@@ -328,6 +339,8 @@ def call_openrouter(model, prompt):
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(chunk, dict):
+                    continue  # a stray non-object data: chunk — skip, don't abort the call
                 if isinstance(chunk.get("error"), dict):
                     raise RuntimeError(f"upstream error: {chunk['error'].get('message') or 'error'}")
                 if chunk.get("model"):
