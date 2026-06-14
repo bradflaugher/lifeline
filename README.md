@@ -39,8 +39,21 @@ all relevant code and context.
 | `OPENROUTER_API_KEY` | **required** — used for every call |
 | `LIFELINE_DEFAULT_FRIEND` | default friend when the call omits one (default `fusion`) |
 | `LIFELINE_CONFIG` | path to a JSON roster file (else `~/.config/lifeline/lifeline.json` if present) |
-| `LIFELINE_TIMEOUT` | per-call HTTP timeout in seconds (default `180`, clamped 10–600) |
+| `LIFELINE_IDLE_TIMEOUT` | seconds of **silence** before a stream is treated as dead (default `60`, clamped 5–600) |
+| `LIFELINE_MAX_SECONDS` | absolute backstop on one call; `0` = unlimited (default `0`, else clamped 30–7200) |
 | `LIFELINE_MAX_TOKENS` | max output tokens per call (default `8000`, clamped 256–32000) |
+| `LIFELINE_OPENROUTER_URL` | override the OpenRouter endpoint (testing / proxies) |
+
+### How the timeout works
+
+The call is **streamed**, so there's no fixed wall-clock cap that could cut off a
+friend who's still thinking. Instead it uses an **idle timeout**: as long as bytes
+keep arriving — answer tokens, or OpenRouter's `: OPENROUTER PROCESSING` keep-alives —
+the call keeps going, however long it takes. It only fails if the stream goes
+*silent* for `LIFELINE_IDLE_TIMEOUT` seconds (dead connection), which it then reports
+fast instead of hanging. `LIFELINE_MAX_SECONDS` is an optional hard backstop; left at
+`0`, the only absolute ceiling is your **host's** MCP tool timeout — so for long
+Fable 5 reasoning, set that generously (e.g. Crush `"timeout": 1800`).
 
 The roster is read only from `$LIFELINE_CONFIG` or `~/.config/lifeline/lifeline.json`
 — never the current directory — so launching an agent inside an untrusted repo

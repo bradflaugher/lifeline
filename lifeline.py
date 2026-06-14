@@ -27,13 +27,15 @@ keeps answering `ping` while a long call is in flight.
 
 import json
 import os
+import socket
 import sys
 import threading
+import time
 import urllib.request
 import urllib.error
 
 SERVER_NAME = "lifeline"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -78,8 +80,26 @@ def _env_int(name, default, lo, hi):
         return default
 
 
-def get_timeout():
-    return _env_int("LIFELINE_TIMEOUT", 180, 10, 600)
+def get_idle_timeout():
+    # Seconds of *silence* (no bytes at all) before a stream is declared dead.
+    return _env_int("LIFELINE_IDLE_TIMEOUT", 60, 5, 600)
+
+
+def get_max_seconds():
+    # Absolute backstop on a single call. 0 = unlimited (let the idle timeout and
+    # the host's own tool timeout govern). Otherwise clamped to 30..7200s.
+    v = os.environ.get("LIFELINE_MAX_SECONDS")
+    if v is None:
+        return 0
+    try:
+        n = int(v)
+    except ValueError:
+        return 0
+    return 0 if n <= 0 else max(30, min(7200, n))
+
+
+def get_endpoint():
+    return os.environ.get("LIFELINE_OPENROUTER_URL") or OPENROUTER_URL
 
 
 def get_max_tokens():
@@ -155,8 +175,42 @@ def default_friend_name(friends):
 
 # --- OpenRouter transport ----------------------------------------------------
 
+def _meta(served, cost):
+    out = served
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        out += f" · cost ${cost:.4f}"
+    return out
+
+
+def _parse_single_body(raw, model):
+    """Fallback parser for providers that ignore stream mode and return one JSON body."""
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise RuntimeError("OpenRouter response exceeded size cap")
+    text = raw.decode("utf-8", "replace")
+    # Strip any ": OPENROUTER PROCESSING" keep-alive comment lines (JSON escapes
+    # newlines, so a physical line starting with ':' is never response content).
+    if "\n:" in text or text.lstrip().startswith(":"):
+        text = "\n".join(line for line in text.splitlines() if not line.startswith(":"))
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected OpenRouter response (not an object)")
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        upstream = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) else None
+        raise RuntimeError(f"upstream error: {upstream or 'no choices returned'}")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    answer = (message or {}).get("content")
+    if not isinstance(answer, str) or not answer.strip():
+        raise RuntimeError("upstream returned no text content")
+    cost = (data.get("usage") or {}).get("cost") if isinstance(data.get("usage"), dict) else None
+    return answer, _meta(data.get("model", model), cost)
+
+
 def call_openrouter(model, prompt):
-    """Return (answer, meta). Raises on transport/HTTP/shape failure."""
+    """Return (answer, meta). Streams the response: a working-but-slow call is never
+    cut off (each arriving byte resets the idle clock), while a silent/dead stream
+    fails fast after `idle` seconds of no data. Raises on transport/HTTP/shape failure.
+    """
     api_key = get_api_key()
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
@@ -168,47 +222,73 @@ def call_openrouter(model, prompt):
             {"role": "user", "content": prompt},
         ],
         "max_tokens": get_max_tokens(),
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
     headers = {
         "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
+        "Accept": "text/event-stream",
         "HTTP-Referer": "https://github.com/bradflaugher/lifeline",
         "X-Title": "lifeline phone_a_friend",
     }
-    req = urllib.request.Request(OPENROUTER_URL, data=json.dumps(body).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=get_timeout()) as resp:
-        raw = resp.read(MAX_RESPONSE_BYTES + 1)
-    if len(raw) > MAX_RESPONSE_BYTES:
-        raise RuntimeError("OpenRouter response exceeded size cap")
+    idle = get_idle_timeout()
+    max_seconds = get_max_seconds()
+    req = urllib.request.Request(get_endpoint(), data=json.dumps(body).encode(), headers=headers)
 
-    # On slow/long requests OpenRouter emits ": OPENROUTER PROCESSING" SSE keep-alive
-    # comment lines before the JSON body, even on the non-streaming endpoint
-    # (confirmed empirically — a big/slow call returns these). The body is a single
-    # JSON document and JSON escapes newlines, so any physical line that starts with
-    # ':' is a keep-alive comment, never response content — safe to drop.
-    text = raw.decode("utf-8", "replace")
-    if "\n:" in text or text.lstrip().startswith(":"):
-        text = "\n".join(line for line in text.splitlines() if not line.startswith(":"))
-    data = json.loads(text)
+    # The socket timeout applies per read, so it is an *idle* timeout: the call may
+    # run for many minutes as long as bytes (tokens or ": OPENROUTER PROCESSING"
+    # keep-alives) keep arriving — it only fails after `idle` seconds of total silence.
+    try:
+        resp = urllib.request.urlopen(req, timeout=idle)
+    except (socket.timeout, TimeoutError):
+        raise RuntimeError(f"no response within {idle}s (connection idle)")
 
-    if not isinstance(data, dict):
-        raise RuntimeError("unexpected OpenRouter response (not an object)")
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        # OpenRouter can return HTTP 200 with an {"error": {...}} body and no choices.
-        upstream = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) else None
-        raise RuntimeError(f"upstream error: {upstream or 'no choices returned'}")
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    answer = (message or {}).get("content")
-    if not isinstance(answer, str) or not answer.strip():
-        raise RuntimeError("upstream returned no text content")
+    with resp:
+        if "text/event-stream" not in (resp.headers.get("Content-Type") or "").lower():
+            return _parse_single_body(resp.read(MAX_RESPONSE_BYTES + 1), model)  # provider ignored stream
 
-    served = data.get("model", model)
-    cost = (data.get("usage") or {}).get("cost") if isinstance(data.get("usage"), dict) else None
-    meta = served
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-        meta += f" · cost ${cost:.4f}"
-    return answer, meta
+        start = time.monotonic()
+        total = 0
+        parts = []
+        served, cost = model, None
+        try:
+            for raw_line in resp:  # readline() under the hood; each recv bounded by `idle`
+                if max_seconds and (time.monotonic() - start) > max_seconds:
+                    raise RuntimeError(f"exceeded max call duration ({max_seconds}s)")
+                total += len(raw_line)
+                if total > MAX_RESPONSE_BYTES:
+                    raise RuntimeError("stream exceeded size cap")
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line or line.startswith(":"):
+                    continue  # blank line or keep-alive comment — already reset the idle clock
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(chunk.get("error"), dict):
+                    raise RuntimeError(f"upstream error: {chunk['error'].get('message') or 'error'}")
+                if chunk.get("model"):
+                    served = chunk["model"]
+                usage = chunk.get("usage")
+                if isinstance(usage, dict) and usage.get("cost") is not None:
+                    cost = usage["cost"]
+                for ch in (chunk.get("choices") or []):
+                    piece = (ch.get("delta") or {}).get("content") if isinstance(ch, dict) else None
+                    if isinstance(piece, str):
+                        parts.append(piece)
+        except (socket.timeout, TimeoutError):
+            raise RuntimeError(f"stream went silent for {idle}s — treating it as dead")
+
+    answer = "".join(parts).strip()
+    if not answer:
+        raise RuntimeError("stream produced no text content")
+    return answer, _meta(served, cost)
 
 
 # --- Tool --------------------------------------------------------------------
