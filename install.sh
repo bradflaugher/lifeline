@@ -9,11 +9,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/bradflaugher/lifeline/main/install.sh | bash
 #
-# Optional env: LIFELINE_DIR=/path   where to clone (default ~/lifeline)
+# Choose the install dir (default ~/lifeline) — positional arg or $LIFELINE_DIR:
+#   curl -fsSL .../install.sh | bash -s -- ~/code/lifeline
+#   curl -fsSL .../install.sh | LIFELINE_DIR=/opt/lifeline bash
 set -euo pipefail
 
 REPO="https://github.com/bradflaugher/lifeline.git"
-DIR="${LIFELINE_DIR:-$HOME/lifeline}"
+# Install dir: positional arg wins, then $LIFELINE_DIR, then ~/lifeline.
+DIR="${1:-${LIFELINE_DIR:-$HOME/lifeline}}"
 b() { printf '\n\033[1m%s\033[0m\n' "$*"; }   # bold heading
 i() { printf '  %s\n' "$*"; }                 # indented line
 
@@ -23,13 +26,13 @@ command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required."; exit
 # --- get the code ---
 if [ -d "$DIR/.git" ]; then
   i "Updating $DIR"
-  git -C "$DIR" pull --quiet --ff-only 2>/dev/null || i "(kept current checkout)"
+  git -C "$DIR" pull --quiet --ff-only </dev/null 2>/dev/null || i "(kept current checkout)"
 elif [ -f "$DIR/lifeline.py" ]; then
   i "Using $DIR"
 else
   command -v git >/dev/null 2>&1 || { echo "ERROR: git is required to clone."; exit 1; }
   i "Cloning $REPO -> $DIR"
-  git clone --quiet "$REPO" "$DIR"
+  git clone --quiet --depth 1 "$REPO" "$DIR" </dev/null
 fi
 SERVER="$DIR/lifeline.py"
 [ -f "$SERVER" ] || { echo "ERROR: $SERVER not found."; exit 1; }
@@ -51,12 +54,19 @@ added=0; codex_new=0
 
 try_add() {  # label  get-cmd... '|' add-cmd...
   local label="$1"; shift
-  local get=(); while [ "$1" != "|" ]; do get+=("$1"); shift; done; shift
-  if "${get[@]}" >/dev/null 2>&1; then
+  local -a get=()
+  # Short-circuit on $# BEFORE reading $1, so a missing '|' can't trip `set -u`.
+  while [ "$#" -gt 0 ] && [ "$1" != "|" ]; do get+=("$1"); shift; done
+  if [ "$#" -eq 0 ] || [ "${#get[@]}" -eq 0 ]; then
+    echo "ERROR: installer bug — malformed try_add call for $label" >&2; exit 2
+  fi
+  shift  # drop the '|'
+  # </dev/null: under `curl | bash` the script stream is stdin; never let a child read it.
+  if "${get[@]}" </dev/null >/dev/null 2>&1; then
     i "$label: already configured — skipping (your settings kept)"
     return 1
   fi
-  if "$@" >/dev/null 2>&1; then i "$label: configured"; added=$((added+1)); return 0; fi
+  if "$@" </dev/null >/dev/null 2>&1; then i "$label: configured"; added=$((added+1)); return 0; fi
   i "$label: detected but 'mcp add' failed — configure manually"; return 1
 }
 
@@ -73,7 +83,11 @@ command -v grok >/dev/null 2>&1 && \
   try_add "Grok Build" grok mcp get lifeline '|' \
           grok mcp add lifeline -t stdio -c python3 -a "$SERVER" || true
 
-[ "$added" -eq 0 ] && i "(nothing newly added — agents missing or already configured)"
+# A plain `[ ... ] && ...` would return non-zero (and trip `set -e` on bash 3.2 / macOS)
+# whenever added>0, silently aborting before the smoke test — so use a real `if`.
+if [ "$added" -eq 0 ]; then
+  i "(nothing newly added — agents missing or already configured)"
+fi
 
 # --- Codex timeout note (only when we just added it) ---
 if [ "$codex_new" -eq 1 ]; then
@@ -105,10 +119,13 @@ EOF
 
 # --- smoke test (no API call: initialize + tools/list only) ---
 b "Smoke test"
+# Use `timeout` if present (GNU coreutils; absent on stock macOS) so a hung server
+# can't hang the installer. The server exits on stdin EOF anyway — this is insurance.
+RUN=""; command -v timeout >/dev/null 2>&1 && RUN="timeout 15"
 if printf '%s\n%s\n' \
    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-   | python3 "$SERVER" 2>/dev/null | grep -q phone_a_friend; then
+   | $RUN python3 "$SERVER" 2>/dev/null | grep -q phone_a_friend; then
   i "Server starts and exposes phone_a_friend — OK"
 else
   i "Smoke test FAILED — run 'python3 $SERVER' and check for errors."

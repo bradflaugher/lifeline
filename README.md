@@ -104,11 +104,22 @@ lifeline on demand.
 curl -fsSL https://raw.githubusercontent.com/bradflaugher/lifeline/main/install.sh | bash
 ```
 
-Clones to `~/lifeline` (override with `LIFELINE_DIR=...`), then registers
-`lifeline` with every coding agent it finds that has an `mcp add` command
-(Claude Code, Codex, Grok Build) and prints copy-paste snippets for the
-config-file agents (Crush, Antigravity, opencode). It's **safe and re-runnable**:
-it never edits your config files and skips any agent already configured.
+Installs to `~/lifeline` by default. To pick the location, pass it as an argument
+(note the `-s --`) or use the env var:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bradflaugher/lifeline/main/install.sh | bash -s -- ~/code/lifeline
+curl -fsSL https://raw.githubusercontent.com/bradflaugher/lifeline/main/install.sh | LIFELINE_DIR=/opt/lifeline bash
+```
+
+> Use `bash -s -- <dir>` for the argument form — `bash <dir>` would treat `<dir>`
+> as a script file, not the install location.
+
+It then registers `lifeline` with every coding agent it finds that has an
+`mcp add` command (Claude Code, Codex, Grok Build) and prints copy-paste snippets
+for the config-file agents (Crush, Antigravity, opencode). It's **safe and
+re-runnable**: it never edits your config files and skips any agent already
+configured.
 
 Only prerequisite is `python3` and an **`OPENROUTER_API_KEY`** in your environment
 (`export OPENROUTER_API_KEY=sk-or-...` — get one at <https://openrouter.ai/keys>).
