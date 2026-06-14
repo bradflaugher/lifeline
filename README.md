@@ -52,8 +52,14 @@ keep arriving — answer tokens, or OpenRouter's `: OPENROUTER PROCESSING` keep-
 the call keeps going, however long it takes. It only fails if the stream goes
 *silent* for `LIFELINE_IDLE_TIMEOUT` seconds (dead connection), which it then reports
 fast instead of hanging. `LIFELINE_MAX_SECONDS` is an optional hard backstop; left at
-`0`, the only absolute ceiling is your **host's** MCP tool timeout — so for long
-Fable 5 reasoning, set that generously (e.g. Crush `"timeout": 1800`).
+`0`, the only absolute ceiling is your **host's** MCP tool timeout. Those defaults
+vary and some are short — set them generously for long Fable 5 reasoning:
+
+| Host | Tool-timeout setting | Default | Recommended |
+|---|---|---|---|
+| Crush | `timeout` (seconds) in `crush.json` | 300 | `1800` |
+| Codex | `tool_timeout_sec` in `config.toml` | **60** | `1800` |
+| Claude Code | `MCP_TOOL_TIMEOUT` (ms) env | ~28h | leave unset |
 
 The roster is read only from `$LIFELINE_CONFIG` or `~/.config/lifeline/lifeline.json`
 — never the current directory — so launching an agent inside an untrusted repo
@@ -106,6 +112,8 @@ claude mcp add lifeline -s user -- python3 ~/lifeline/lifeline.py
 ```
 
 First call prompts once for permission (choose "always allow"); auto-approved in `claude -p`.
+Claude Code's MCP tool timeout already defaults to ~28h, so long streaming calls
+aren't cut off — no extra config needed. (To shorten it, set `MCP_TOOL_TIMEOUT` in ms.)
 
 ### Codex
 
@@ -114,12 +122,15 @@ codex mcp add lifeline -- python3 ~/lifeline/lifeline.py
 # or: codex mcp add lifeline --env OPENROUTER_API_KEY=sk-or-... -- python3 ~/lifeline/lifeline.py
 ```
 
-Equivalent `~/.codex/config.toml`:
+Then **raise the tool timeout** — Codex defaults to **60s**, which cuts off most
+phone-a-friend calls. Edit `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.lifeline]
 command = "python3"
 args = ["/root/lifeline/lifeline.py"]
+startup_timeout_sec = 30
+tool_timeout_sec = 1800   # default is 60s — far too short for a deliberation panel
 # env = { OPENROUTER_API_KEY = "sk-or-..." }   # only if not inherited
 ```
 
@@ -136,12 +147,14 @@ args = ["/root/lifeline/lifeline.py"]
       "command": "python3",
       "args": ["/root/lifeline/lifeline.py"],
       "env": { "OPENROUTER_API_KEY": "$OPENROUTER_API_KEY" },
-      "timeout": 300
+      "timeout": 1800
     }
   }
 }
 ```
 
+`timeout` (seconds) is Crush's MCP tool timeout — set it generously (here 30 min)
+so a long streaming call isn't cut off; lifeline's idle timeout handles dead ones.
 Crush expands `$VAR` in `env`, so the key stays out of the file. Non-interactive
 `crush run` auto-approves MCP tools; the interactive TUI prompts once.
 
