@@ -129,7 +129,7 @@ phone-a-friend calls. Edit `~/.codex/config.toml`:
 ```toml
 [mcp_servers.lifeline]
 command = "python3"
-args = ["/root/lifeline/lifeline.py"]
+args = ["/home/you/lifeline/lifeline.py"]
 startup_timeout_sec = 30
 tool_timeout_sec = 1800   # default is 60s — far too short for a deliberation panel
 # env = { OPENROUTER_API_KEY = "sk-or-..." }   # only if not inherited
@@ -146,7 +146,7 @@ tool_timeout_sec = 1800   # default is 60s — far too short for a deliberation 
     "lifeline": {
       "type": "stdio",
       "command": "python3",
-      "args": ["/root/lifeline/lifeline.py"],
+      "args": ["/home/you/lifeline/lifeline.py"],
       "env": { "OPENROUTER_API_KEY": "$OPENROUTER_API_KEY" },
       "timeout": 1800
     }
@@ -169,7 +169,7 @@ Antigravity 2.0, the IDE, and the CLI share one MCP config at
   "mcpServers": {
     "lifeline": {
       "command": "python3",
-      "args": ["/root/lifeline/lifeline.py"],
+      "args": ["/home/you/lifeline/lifeline.py"],
       "env": { "OPENROUTER_API_KEY": "sk-or-..." }
     }
   }
@@ -179,7 +179,7 @@ Antigravity 2.0, the IDE, and the CLI share one MCP config at
 ### Grok Build (xAI)
 
 ```bash
-grok mcp add lifeline -t stdio -c python3 -a /root/lifeline/lifeline.py
+grok mcp add lifeline -t stdio -c python3 -a ~/lifeline/lifeline.py
 # verify: grok mcp list   •   inspect discovery: grok inspect
 ```
 
@@ -193,7 +193,7 @@ Equivalent project `.mcp.json`:
       "transport": {
         "type": "stdio",
         "command": "python3",
-        "args": ["/root/lifeline/lifeline.py"],
+        "args": ["/home/you/lifeline/lifeline.py"],
         "env": { "OPENROUTER_API_KEY": "sk-or-..." }
       }
     }
@@ -211,7 +211,7 @@ Equivalent project `.mcp.json`:
   "mcp": {
     "lifeline": {
       "type": "local",
-      "command": ["python3", "/root/lifeline/lifeline.py"],
+      "command": ["python3", "/home/you/lifeline/lifeline.py"],
       "enabled": true,
       "environment": { "OPENROUTER_API_KEY": "sk-or-..." }
     }
