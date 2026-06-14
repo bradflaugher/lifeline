@@ -38,9 +38,15 @@ all relevant code and context.
 |---|---|
 | `OPENROUTER_API_KEY` | **required** — used for every call |
 | `LIFELINE_DEFAULT_FRIEND` | default friend when the call omits one (default `fusion`) |
-| `LIFELINE_CONFIG` | path to a JSON roster file (else `./lifeline.json` if present) |
+| `LIFELINE_CONFIG` | path to a JSON roster file (else `~/.config/lifeline/lifeline.json` if present) |
+| `LIFELINE_TIMEOUT` | per-call HTTP timeout in seconds (default `180`, clamped 10–600) |
+| `LIFELINE_MAX_TOKENS` | max output tokens per call (default `8000`, clamped 256–32000) |
 
-Custom roster (`lifeline.json`) — any OpenRouter model can be a friend:
+The roster is read only from `$LIFELINE_CONFIG` or `~/.config/lifeline/lifeline.json`
+— never the current directory — so launching an agent inside an untrusted repo
+can't silently reconfigure who you phone. Each friend needs a non-empty string
+`model`; invalid entries are ignored (logged to stderr). Example roster — any
+OpenRouter model can be a friend:
 
 ```json
 {
