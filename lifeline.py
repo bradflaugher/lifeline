@@ -35,7 +35,7 @@ import urllib.request
 import urllib.error
 
 SERVER_NAME = "lifeline"
-SERVER_VERSION = "2.2.1"
+SERVER_VERSION = "2.2.2"
 DEFAULT_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -331,9 +331,12 @@ def call_openrouter(model, prompt):
 
         parts = []
         served, cost = model, None
+        saw_done = False   # the `data: [DONE]` terminator
+        saw_usage = False  # the final usage chunk (sent just before [DONE] with include_usage)
         try:
             for data in _iter_sse_events(resp, idle, max_seconds):
                 if data == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     chunk = json.loads(data)
@@ -346,14 +349,25 @@ def call_openrouter(model, prompt):
                 if chunk.get("model"):
                     served = chunk["model"]
                 usage = chunk.get("usage")
-                if isinstance(usage, dict) and usage.get("cost") is not None:
-                    cost = usage["cost"]
+                if isinstance(usage, dict):
+                    saw_usage = True
+                    if usage.get("cost") is not None:
+                        cost = usage["cost"]
                 for ch in (chunk.get("choices") or []):
                     piece = (ch.get("delta") or {}).get("content") if isinstance(ch, dict) else None
                     if isinstance(piece, str):
                         parts.append(piece)
         except (socket.timeout, TimeoutError):
             raise RuntimeError(f"stream went silent for {idle}s — treating it as dead")
+
+    # A complete OpenRouter SSE stream terminates with `data: [DONE]` (and, with
+    # include_usage, a final usage chunk just before it). If neither arrived, the
+    # connection closed mid-stream: whatever we have is TRUNCATED. Fail loudly so
+    # the caller can retry, instead of returning a misleading partial — e.g. a
+    # panel model's "I'll consult the panel…" preamble with the real synthesis cut
+    # off, which otherwise looks like a complete (tiny) answer.
+    if not (saw_done or saw_usage):
+        raise RuntimeError("stream closed before completion ([DONE]/usage never arrived) — likely truncated; retry")
 
     answer = "".join(parts).strip()
     if not answer:
