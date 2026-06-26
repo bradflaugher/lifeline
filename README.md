@@ -277,4 +277,4 @@ code audits sharper — it flags real risks instead of padding the answer with b
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
