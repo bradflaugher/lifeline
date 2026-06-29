@@ -11,13 +11,16 @@ API key). Backends ("friends") are pluggable; the built-in roster is:
 
   * fusion — OpenRouter Fusion: a panel of frontier models (Opus, GPT, Gemini
              Pro) deliberate in parallel and a judge synthesizes their answers.
-  * fable  — Claude Fable 5 (via OpenRouter: `anthropic/claude-fable-5`).
-             Requires Fable access on your OpenRouter account; until then the
-             call returns a clear "not available" error.
 
-Override the roster with a JSON file at $LIFELINE_CONFIG or
-~/.config/lifeline/lifeline.json (see README). Pick the default friend with
-$LIFELINE_DEFAULT_FRIEND.
+Add more friends with a JSON file at $LIFELINE_CONFIG or
+~/.config/lifeline/lifeline.json (see README) — any OpenRouter model can be a
+friend. Pick the default friend with $LIFELINE_DEFAULT_FRIEND.
+
+A Fusion panel is slow (often minutes) and expensive, so a single *transient*
+hiccup — a dropped/truncated stream, an idle connection, or a 5xx/429 — is
+retried automatically (LIFELINE_MAX_RETRIES, default 2) on a fresh connection
+before the failure is ever surfaced to the caller. This is the main reliability
+win: most "the friend call failed" reports were one-off blips that a retry fixes.
 
 Stdlib only (json + urllib + threading) — no pip install, so it runs unchanged
 wherever the host agent launches it. MCP stdio transport = newline-delimited
@@ -35,7 +38,7 @@ import urllib.request
 import urllib.error
 
 SERVER_NAME = "lifeline"
-SERVER_VERSION = "2.2.2"
+SERVER_VERSION = "2.3.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -121,6 +124,13 @@ def get_max_concurrency():
     return _env_int("LIFELINE_MAX_CONCURRENCY", 4, 1, 64)
 
 
+def get_max_retries():
+    # How many extra attempts after the first on a *transient* failure (truncated
+    # or idle stream, dropped connection, 5xx/429). 0 disables; clamped 0..5. Each
+    # retry re-issues the whole call on a fresh connection — there is no resume.
+    return _env_int("LIFELINE_MAX_RETRIES", 2, 0, 5)
+
+
 # Bounds simultaneous phone_a_friend calls (each holds a thread + an HTTPS
 # connection + burns OpenRouter quota); excess is rejected, not silently queued.
 _TOOL_SEM = threading.BoundedSemaphore(get_max_concurrency())
@@ -135,12 +145,6 @@ DEFAULT_FRIENDS = {
                  "answers. Best for second opinions, design trade-offs, "
                  "compare-and-contrast, and 'am I missing something?' checks.",
         "model": "openrouter/fusion",
-    },
-    "fable": {
-        "blurb": "Claude Fable 5 — Anthropic's most capable model; deep single-model "
-                 "reasoning for the hardest bugs, tricky algorithms, and long-horizon "
-                 "design problems. (Requires Fable access on your OpenRouter account.)",
-        "model": "anthropic/claude-fable-5",
     },
 }
 
@@ -195,6 +199,29 @@ def default_friend_name(friends):
 
 # --- OpenRouter transport ----------------------------------------------------
 
+class RetryableError(RuntimeError):
+    """A *transient* transport failure worth re-issuing: a truncated/idle/dead
+    stream, a dropped connection, or a transient upstream hiccup (5xx/429).
+    Non-transient problems (size cap exceeded, a malformed response shape, an
+    auth/credit/bad-request/no-such-model error) raise plain RuntimeError /
+    HTTPError instead so they fail fast without burning retries."""
+
+
+def _http_is_retryable(code):
+    # 408 request timeout, 429 rate limit, and any 5xx (incl. Cloudflare 52x in
+    # front of OpenRouter) are transient; other 4xx (auth, bad request, no such
+    # model, payment) won't fix themselves, so don't waste retries on them. Used
+    # for both HTTPError.code and the in-band `error.code` carried inside a 200
+    # SSE stream. A missing/non-int code is treated as non-transient — the safe
+    # default for a slow, expensive call where a needless retry is costly.
+    return isinstance(code, int) and (code in (408, 429) or code >= 500)
+
+
+def _error_exc(code):
+    # Pick RetryableError vs plain RuntimeError for an upstream error by its code.
+    return RetryableError if _http_is_retryable(code) else RuntimeError
+
+
 def _meta(served, cost):
     out = served
     if isinstance(cost, (int, float)) and not isinstance(cost, bool):
@@ -216,12 +243,14 @@ def _parse_single_body(raw, model):
         raise RuntimeError("unexpected OpenRouter response (not an object)")
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
-        upstream = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) else None
-        raise RuntimeError(f"upstream error: {upstream or 'no choices returned'}")
+        err = data.get("error") if isinstance(data.get("error"), dict) else None
+        if err:  # a real upstream error: retry only if its code says transient
+            raise _error_exc(err.get("code"))(f"upstream error: {err.get('message') or 'error'}")
+        raise RuntimeError("unexpected OpenRouter response (no choices)")  # malformed: fail fast
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
     answer = (message or {}).get("content")
     if not isinstance(answer, str) or not answer.strip():
-        raise RuntimeError("upstream returned no text content")
+        raise RetryableError("upstream returned no text content")
     cost = (data.get("usage") or {}).get("cost") if isinstance(data.get("usage"), dict) else None
     return answer, _meta(data.get("model", model), cost)
 
@@ -316,14 +345,14 @@ def call_openrouter(model, prompt):
     except urllib.error.HTTPError:
         raise  # a 4xx/5xx is handled (with its status code) by run_phone_a_friend
     except (socket.timeout, TimeoutError):
-        raise RuntimeError(f"no response within {idle}s (connection idle)")
+        raise RetryableError(f"no response within {idle}s (connection idle)")
     except urllib.error.URLError as e:
         # A connect timeout arrives as URLError wrapping the timeout in .reason,
         # not as a bare socket.timeout — normalize it to the same idle message.
         reason = getattr(e, "reason", e)
         if isinstance(reason, (socket.timeout, TimeoutError)):
-            raise RuntimeError(f"no response within {idle}s (connection idle)")
-        raise RuntimeError(f"connection failed: {reason}")
+            raise RetryableError(f"no response within {idle}s (connection idle)")
+        raise RetryableError(f"connection failed: {reason}")
 
     with resp:
         if "text/event-stream" not in (resp.headers.get("Content-Type") or "").lower():
@@ -345,7 +374,11 @@ def call_openrouter(model, prompt):
                 if not isinstance(chunk, dict):
                     continue  # a stray non-object data: chunk — skip, don't abort the call
                 if isinstance(chunk.get("error"), dict):
-                    raise RuntimeError(f"upstream error: {chunk['error'].get('message') or 'error'}")
+                    # A streaming call has already sent HTTP 200, so provider
+                    # failures (auth/credit/moderation/bad-model, or a transient
+                    # 5xx/429) arrive in-band carrying a code — classify by it.
+                    err = chunk["error"]
+                    raise _error_exc(err.get("code"))(f"upstream error: {err.get('message') or 'error'}")
                 if chunk.get("model"):
                     served = chunk["model"]
                 usage = chunk.get("usage")
@@ -358,7 +391,7 @@ def call_openrouter(model, prompt):
                     if isinstance(piece, str):
                         parts.append(piece)
         except (socket.timeout, TimeoutError):
-            raise RuntimeError(f"stream went silent for {idle}s — treating it as dead")
+            raise RetryableError(f"stream went silent for {idle}s — treating it as dead")
 
     # A complete OpenRouter SSE stream terminates with `data: [DONE]` (and, with
     # include_usage, a final usage chunk just before it). If neither arrived, the
@@ -367,12 +400,69 @@ def call_openrouter(model, prompt):
     # panel model's "I'll consult the panel…" preamble with the real synthesis cut
     # off, which otherwise looks like a complete (tiny) answer.
     if not (saw_done or saw_usage):
-        raise RuntimeError("stream closed before completion ([DONE]/usage never arrived) — likely truncated; retry")
+        raise RetryableError("stream closed before completion ([DONE]/usage never arrived) — likely truncated")
 
     answer = "".join(parts).strip()
     if not answer:
-        raise RuntimeError("stream produced no text content")
+        raise RetryableError("stream produced no text content")
     return answer, _meta(served, cost)
+
+
+def _retry_after_seconds(exc):
+    # Honor a numeric Retry-After header (seconds) when present, clamped to a sane
+    # range; ignore the HTTP-date form. Returns None if absent/unparseable.
+    try:
+        raw = exc.headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(1, min(60, int(raw.strip())))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _backoff_seconds(attempt):
+    # Exponential, capped: 2s, 4s, 8s, ... ≤ 15s. (No jitter: concurrency is small.)
+    return min(2.0 * (2 ** attempt), 15.0)
+
+
+def call_with_retries(model, prompt, name, sleep=time.sleep):
+    """call_openrouter, but transparently re-issued on *transient* failures.
+
+    A Fusion call is slow and expensive and runs over a long-lived HTTPS stream,
+    so the common failure is a one-off blip near the end (a dropped/truncated
+    stream, an idle socket, a 5xx/429) — not a bad request. Retrying on a fresh
+    connection turns most of those into a successful answer instead of an error
+    the caller has to notice and re-issue by hand. Non-transient failures
+    (RuntimeError, non-retryable HTTPError) propagate on the first try.
+    """
+    attempts = get_max_retries() + 1
+    for i in range(attempts):
+        last = i == attempts - 1
+        try:
+            return call_openrouter(model, prompt)
+        except RetryableError as e:
+            if last:
+                raise
+            delay = _backoff_seconds(i)
+            print(f"lifeline: {name} transient failure "
+                  f"(attempt {i + 1}/{attempts}), retrying in {delay:.0f}s: {e}", file=sys.stderr)
+            sleep(delay)
+        except urllib.error.HTTPError as e:
+            if last or not _http_is_retryable(e.code):
+                raise
+            delay = _retry_after_seconds(e) or _backoff_seconds(i)
+            try:
+                e.close()  # free the failed-response connection before sleeping
+            except Exception:  # noqa: BLE001
+                pass
+            print(f"lifeline: {name} HTTP {e.code} "
+                  f"(attempt {i + 1}/{attempts}), retrying in {delay:.0f}s", file=sys.stderr)
+            sleep(delay)
+    # Unreachable: the loop either returns, or re-raises on the final attempt.
+    raise RuntimeError("retry loop exhausted")  # pragma: no cover
 
 
 # --- Tool --------------------------------------------------------------------
@@ -449,7 +539,7 @@ def run_phone_a_friend(args, friends):
     prompt = question if not context else f"{question}\n\n--- Additional context ---\n{context}"
 
     try:
-        answer, meta = call_openrouter(model, prompt)
+        answer, meta = call_with_retries(model, prompt, name)
     except urllib.error.HTTPError as e:
         try:
             detail = e.read(4096).decode("utf-8", "replace")

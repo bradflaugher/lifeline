@@ -17,7 +17,10 @@ A *friend* is an advisor backed by an OpenRouter model. Built-in roster:
 | Friend | What it is |
 |---|---|
 | **fusion** | OpenRouter **Fusion** — a panel of frontier models (Claude Opus, GPT, Gemini Pro) deliberate in parallel and a judge synthesizes their answers. Great for "compare and contrast", design trade-offs, and "am I missing something?". |
-| **fable** | Anthropic **Claude Fable 5** via OpenRouter (`anthropic/claude-fable-5`) — deepest single-model reasoning for the hardest bugs and long-horizon problems. Requires Fable access on your OpenRouter account; until then the call returns a clear "not available" error. |
+
+Want a different advisor — a single frontier model, a cheap reasoner, anything on
+OpenRouter? Add it yourself in a [config file](#configuration); any OpenRouter
+model can be a friend.
 
 ## The tool
 
@@ -48,10 +51,26 @@ want to tune something:
 | `LIFELINE_DEFAULT_FRIEND` | `fusion` | friend used when a call omits one |
 | `LIFELINE_CONFIG` | — | path to a custom roster file (else `~/.config/lifeline/lifeline.json`) |
 | `LIFELINE_IDLE_TIMEOUT` | `60` | seconds of **silence** before a stream is treated as dead (5–600) |
-| `LIFELINE_MAX_SECONDS` | `0` | absolute backstop per call; `0` = unlimited (else 30–7200) |
+| `LIFELINE_MAX_SECONDS` | `0` | absolute backstop **per attempt**; `0` = unlimited (else 30–7200) |
+| `LIFELINE_MAX_RETRIES` | `2` | extra attempts after the first on a **transient** failure; `0` disables (0–5) |
 | `LIFELINE_MAX_TOKENS` | `8000` | max output tokens per call (256–32000) |
 | `LIFELINE_MAX_CONCURRENCY` | `4` | max simultaneous calls; excess rejected, not queued (1–64) |
 | `LIFELINE_OPENROUTER_URL` | — | override the OpenRouter endpoint (testing / proxies) |
+
+### Automatic retry (why calls "just work" now)
+
+A Fusion panel runs over a long-lived HTTPS stream for tens of seconds to minutes,
+so the usual failure isn't a bad request — it's a *one-off blip*: the stream drops
+or is truncated near the end, the socket goes idle, or OpenRouter returns a transient
+`5xx`/`429`. lifeline now **retries those automatically** on a fresh connection
+(`LIFELINE_MAX_RETRIES`, default 2 → up to 3 attempts) with exponential backoff
+(2s, 4s, …, honoring `Retry-After` on `429`). Each retry is logged to stderr.
+
+Only *transient* failures are retried. Permanent ones — a bad API key, an unknown
+model, a malformed request, a response over the size cap (`4xx` other than `408`/`429`)
+— **fail fast on the first try** so you're not left waiting on something a retry can't
+fix. Because retries re-issue the whole call, give your host's tool timeout (below)
+enough room for a few attempts of a long call.
 
 ### How the timeout works
 
@@ -60,9 +79,10 @@ friend who's still thinking. Instead it uses an **idle timeout**: as long as byt
 keep arriving — answer tokens, or OpenRouter's `: OPENROUTER PROCESSING` keep-alives —
 the call keeps going, however long it takes. It only fails if the stream goes
 *silent* for `LIFELINE_IDLE_TIMEOUT` seconds (dead connection), which it then reports
-fast instead of hanging. `LIFELINE_MAX_SECONDS` is an optional hard backstop; left at
-`0`, the only absolute ceiling is your **host's** MCP tool timeout. Those defaults
-vary and some are short — set them generously for long Fable 5 reasoning:
+fast instead of hanging. `LIFELINE_MAX_SECONDS` is an optional hard backstop **per
+attempt**; left at `0`, the only absolute ceiling is your **host's** MCP tool timeout.
+Those defaults vary and some are short — set them generously for a long Fusion
+deliberation (and remember a call may make a few attempts):
 
 | Host | Tool-timeout setting | Default | Recommended |
 |---|---|---|---|
@@ -79,20 +99,26 @@ OpenRouter model can be a friend:
 ```json
 {
   "friends": {
-    "fusion":   { "blurb": "Fusion panel.",   "model": "openrouter/fusion" },
-    "fable":    { "blurb": "Claude Fable 5.",  "model": "anthropic/claude-fable-5" },
-    "deepseek": { "blurb": "Cheap reasoning.", "model": "deepseek/deepseek-v3.2" }
+    "fusion":   { "blurb": "Fusion panel.",         "model": "openrouter/fusion" },
+    "opus":     { "blurb": "Single frontier model.", "model": "anthropic/claude-opus-4.8" },
+    "deepseek": { "blurb": "Cheap reasoning.",       "model": "deepseek/deepseek-v3.2" }
   }
 }
 ```
 
+Entries you list are merged over the built-in `fusion`, so you can add advisors
+(a single frontier model, a cheap reasoner, Claude Fable 5 if you have access —
+`anthropic/claude-fable-5`) without losing the default.
+
 ## Cost & latency
 
-Phoning a friend is **slow (~20–60s) and more expensive than a normal call** —
-Fusion fans out to several models, Fable 5 is a frontier model. The tool
-description tells the calling model to use it only for genuinely hard problems,
-not routine edits. Keep your everyday coding model cheap and reach for the
-lifeline on demand.
+Phoning a friend is **slow (~20–60s, sometimes minutes) and more expensive than a
+normal call** — Fusion fans out to several frontier models and a judge synthesizes
+them. (Auto-retry can multiply that cost/latency on a flaky call; that's the price
+of "it just works" — tune or disable it with `LIFELINE_MAX_RETRIES`.) The tool
+description tells the calling model to use it only for genuinely hard problems, not
+routine edits. Keep your everyday coding model cheap and reach for the lifeline on
+demand.
 
 ---
 
