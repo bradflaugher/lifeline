@@ -11,6 +11,8 @@ API key). Backends ("friends") are pluggable; the built-in roster is:
 
   * fusion — OpenRouter Fusion: a panel of frontier models (Opus, GPT, Gemini
              Pro) deliberate in parallel and a judge synthesizes their answers.
+  * fable  — Anthropic Claude Fable (via the ~anthropic/claude-fable-latest
+             alias, so it always points at the newest Fable; 1M-token context).
 
 Add more friends with a JSON file at $LIFELINE_CONFIG or
 ~/.config/lifeline/lifeline.json (see README) — any OpenRouter model can be a
@@ -28,6 +30,7 @@ JSON-RPC 2.0; the tool call is dispatched on a worker thread so the read loop
 keeps answering `ping` while a long call is in flight.
 """
 
+import http.client
 import json
 import os
 import socket
@@ -38,7 +41,7 @@ import urllib.request
 import urllib.error
 
 SERVER_NAME = "lifeline"
-SERVER_VERSION = "2.3.0"
+SERVER_VERSION = "2.4.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -117,7 +120,10 @@ def get_endpoint():
 
 
 def get_max_tokens():
-    return _env_int("LIFELINE_MAX_TOKENS", 8000, 256, 32000)
+    # Reasoning models (e.g. Claude Fable) spend from this same budget on their
+    # hidden reasoning before any answer text, so it must be roomy — a cap that
+    # is exhausted by reasoning yields an empty answer, not a short one.
+    return _env_int("LIFELINE_MAX_TOKENS", 16000, 256, 32000)
 
 
 def get_max_concurrency():
@@ -145,6 +151,15 @@ DEFAULT_FRIENDS = {
                  "answers. Best for second opinions, design trade-offs, "
                  "compare-and-contrast, and 'am I missing something?' checks.",
         "model": "openrouter/fusion",
+    },
+    "fable": {
+        "blurb": "Anthropic Claude Fable (latest) — Anthropic's most capable single "
+                 "model, with a 1M-token context window. Best for the hardest "
+                 "single-model reasoning and questions that need a huge amount of "
+                 "code or context inlined. Faster and cheaper than a fusion panel.",
+        # The leading '~' is part of the OpenRouter slug: it is their alias that
+        # always redirects to the newest model in the Claude Fable family.
+        "model": "~anthropic/claude-fable-latest",
     },
 }
 
@@ -199,6 +214,13 @@ def default_friend_name(friends):
 
 # --- OpenRouter transport ----------------------------------------------------
 
+class FriendError(RuntimeError):
+    """A deterministic failure whose message is safe — and useful — to show the
+    calling agent verbatim (e.g. "the model refused; rephrase" or "raise
+    LIFELINE_MAX_TOKENS"). Everything else is sanitized to the client and
+    detailed only on stderr."""
+
+
 class RetryableError(RuntimeError):
     """A *transient* transport failure worth re-issuing: a truncated/idle/dead
     stream, a dropped connection, or a transient upstream hiccup (5xx/429).
@@ -247,10 +269,22 @@ def _parse_single_body(raw, model):
         if err:  # a real upstream error: retry only if its code says transient
             raise _error_exc(err.get("code"))(f"upstream error: {err.get('message') or 'error'}")
         raise RuntimeError("unexpected OpenRouter response (no choices)")  # malformed: fail fast
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    answer = (message or {}).get("content")
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    answer = (choice.get("message") or {}).get("content")
+    finish = choice.get("finish_reason")
     if not isinstance(answer, str) or not answer.strip():
+        # Same classification as the streaming path: a refusal or an output
+        # budget exhausted by reasoning is deterministic — fail fast, don't retry.
+        if finish == "content_filter":
+            raise FriendError("the model refused to answer (finish_reason=content_filter) "
+                              "— rephrase the question; a retry will not help")
+        if finish == "length":
+            raise FriendError(f"the model spent its whole {get_max_tokens()}-token output budget "
+                              "(likely on hidden reasoning) before any answer text — "
+                              "raise LIFELINE_MAX_TOKENS")
         raise RetryableError("upstream returned no text content")
+    if finish == "length":
+        answer += "\n\n[lifeline: answer truncated — the model hit the LIFELINE_MAX_TOKENS output cap]"
     cost = (data.get("usage") or {}).get("cost") if isinstance(data.get("usage"), dict) else None
     return answer, _meta(data.get("model", model), cost)
 
@@ -356,10 +390,17 @@ def call_openrouter(model, prompt):
 
     with resp:
         if "text/event-stream" not in (resp.headers.get("Content-Type") or "").lower():
-            return _parse_single_body(resp.read(MAX_RESPONSE_BYTES + 1), model)  # provider ignored stream
+            try:
+                raw = resp.read(MAX_RESPONSE_BYTES + 1)  # provider ignored stream mode
+            except (socket.timeout, TimeoutError):
+                raise RetryableError(f"response went silent for {idle}s — treating it as dead")
+            except (OSError, http.client.HTTPException) as e:
+                raise RetryableError(f"connection died while reading the response: {e!r}")
+            return _parse_single_body(raw, model)
 
         parts = []
         served, cost = model, None
+        finish = None      # last finish_reason seen (stop/length/content_filter/error/…)
         saw_done = False   # the `data: [DONE]` terminator
         saw_usage = False  # the final usage chunk (sent just before [DONE] with include_usage)
         try:
@@ -387,11 +428,21 @@ def call_openrouter(model, prompt):
                     if usage.get("cost") is not None:
                         cost = usage["cost"]
                 for ch in (chunk.get("choices") or []):
-                    piece = (ch.get("delta") or {}).get("content") if isinstance(ch, dict) else None
+                    if not isinstance(ch, dict):
+                        continue
+                    piece = (ch.get("delta") or {}).get("content")
                     if isinstance(piece, str):
                         parts.append(piece)
+                    if isinstance(ch.get("finish_reason"), str):
+                        finish = ch["finish_reason"]
         except (socket.timeout, TimeoutError):
             raise RetryableError(f"stream went silent for {idle}s — treating it as dead")
+        except (OSError, http.client.HTTPException) as e:
+            # A reset/dropped connection mid-stream surfaces as ConnectionResetError,
+            # IncompleteRead, etc. — the classic one-off blip on a long stream, and
+            # exactly what the retry machinery exists for. (socket.timeout is an
+            # OSError too, but the narrower clause above catches it first.)
+            raise RetryableError(f"connection died mid-stream: {e!r}")
 
     # A complete OpenRouter SSE stream terminates with `data: [DONE]` (and, with
     # include_usage, a final usage chunk just before it). If neither arrived, the
@@ -404,7 +455,20 @@ def call_openrouter(model, prompt):
 
     answer = "".join(parts).strip()
     if not answer:
+        # An empty answer on a *complete* stream is usually deterministic — the
+        # same request will produce it again, so retrying just multiplies the
+        # wait (on a big prompt, by minutes) before failing anyway. Fail fast
+        # with a message that says what to change instead.
+        if finish == "content_filter":
+            raise FriendError("the model refused to answer (finish_reason=content_filter) "
+                              "— rephrase the question; a retry will not help")
+        if finish == "length":
+            raise FriendError(f"the model spent its whole {get_max_tokens()}-token output budget "
+                              "(likely on hidden reasoning) before any answer text — "
+                              "raise LIFELINE_MAX_TOKENS")
         raise RetryableError("stream produced no text content")
+    if finish == "length":
+        answer += "\n\n[lifeline: answer truncated — the model hit the LIFELINE_MAX_TOKENS output cap]"
     return answer, _meta(served, cost)
 
 
@@ -547,6 +611,12 @@ def run_phone_a_friend(args, friends):
             detail = ""
         print(f"lifeline: OpenRouter HTTP {e.code} ({name}): {detail}", file=sys.stderr)
         return f"phone_a_friend error ({name}): OpenRouter returned HTTP {e.code}.", True
+    except FriendError as e:
+        # Deterministic, self-inflicted failures carry an actionable message the
+        # calling agent should see (rephrase / raise LIFELINE_MAX_TOKENS) —
+        # unlike arbitrary exceptions, which stay sanitized below.
+        print(f"lifeline: phone_a_friend failed ({name}): {e}", file=sys.stderr)
+        return f"phone_a_friend error ({name}): {e}", True
     except Exception as e:  # noqa: BLE001 — full detail to stderr, sanitized to client
         print(f"lifeline: phone_a_friend failed ({name}): {e!r}", file=sys.stderr)
         return f"phone_a_friend error ({name}): {type(e).__name__} (see server logs).", True
