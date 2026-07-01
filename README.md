@@ -248,26 +248,18 @@ Antigravity 2.0, the IDE, and the CLI share one MCP config at
 ### Grok Build (xAI)
 
 ```bash
-grok mcp add lifeline -t stdio -c python3 -a ~/lifeline/lifeline.py
-# verify: grok mcp list   •   inspect discovery: grok inspect
+grok mcp add lifeline -s user python3 -- ~/lifeline/lifeline.py
+# verify: grok mcp list   •   diagnose: grok mcp doctor
 ```
 
-Equivalent project `.mcp.json`:
+Equivalent config in `~/.grok/config.toml` (or project `./.grok/config.toml`):
 
-```json
-{
-  "mcpServers": [
-    {
-      "name": "lifeline",
-      "transport": {
-        "type": "stdio",
-        "command": "python3",
-        "args": ["/home/you/lifeline/lifeline.py"],
-        "env": { "OPENROUTER_API_KEY": "sk-or-..." }
-      }
-    }
-  ]
-}
+```toml
+[mcp_servers.lifeline]
+command = "python3"
+args = ["/home/you/lifeline/lifeline.py"]
+enabled = true
+# env = { OPENROUTER_API_KEY = "sk-or-..." }   # only if not inherited
 ```
 
 ### opencode

@@ -79,9 +79,11 @@ if command -v codex >/dev/null 2>&1; then
           codex mcp add lifeline -- python3 "$SERVER" && codex_new=1 || true
 fi
 
+# grok has no `mcp get`; check via `mcp list` (entries print as "  lifeline: ...").
+grok_has_lifeline() { grok mcp list 2>/dev/null | grep -q '^[[:space:]]*lifeline:'; }
 command -v grok >/dev/null 2>&1 && \
-  try_add "Grok Build" grok mcp get lifeline '|' \
-          grok mcp add lifeline -t stdio -c python3 -a "$SERVER" || true
+  try_add "Grok Build" grok_has_lifeline '|' \
+          grok mcp add lifeline -s user python3 -- "$SERVER" || true
 
 # A plain `[ ... ] && ...` would return non-zero (and trip `set -e` on bash 3.2 / macOS)
 # whenever added>0, silently aborting before the smoke test — so use a real `if`.
